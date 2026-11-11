@@ -557,7 +557,7 @@ def pertama(seri):
     return ""
 
 
-def siapkan(raw, peta, awal):
+def siapkan(raw, peta, awal, isi_bawah=False):
     """Baca isi Excel jadi daftar menu, bahan, dan baris resep + daftar masalah."""
     n = len(raw)
 
@@ -586,6 +586,18 @@ def siapkan(raw, peta, awal):
         d[k] = pd.to_numeric(d[k], errors="coerce")
 
     masalah = []
+
+    if isi_bawah:
+        # Data produk hanya ada di baris pertama tiap produk: buang baris yang benar-benar
+        # kosong, lalu isi kolom produk ke bawah, per blok produk.
+        d = d[
+            ~((d["nama_menu"] == "") & (d["nama_bahan"] == "") & (d["kode_bahan"] == "") & d["qty"].isna())
+        ].copy()
+        blok = (d["nama_menu"] != "").cumsum()
+        for k in ["kode_menu", "nama_menu", "satuan_produk"]:
+            d[k] = d[k].replace("", pd.NA).groupby(blok).ffill().fillna("")
+        for k in ["yield_", "harga_jual"]:
+            d[k] = d[k].groupby(blok).ffill()
 
     # baris kosong total dibuang diam-diam
     d = d[~((d["nama_menu"] == "") & (d["nama_bahan"] == ""))]
@@ -764,7 +776,7 @@ def halaman_impor(berkas):
 
     sheet = st.selectbox("Pilih sheet", xls.sheet_names)
     hdr = st.number_input("Judul kolom ada di baris ke", min_value=1, value=1, step=1)
-    raw = xls.parse(sheet, header=int(hdr) - 1, dtype=object)
+    raw = pd.read_excel(xls, sheet_name=sheet, header=int(hdr) - 1, dtype=object)
     raw = raw.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
     raw.columns = [str(c).strip() for c in raw.columns]
     kolom = list(raw.columns)
@@ -772,6 +784,9 @@ def halaman_impor(berkas):
     if raw.empty or not kolom:
         st.warning("Sheet ini kosong atau judul kolomnya tidak ditemukan. Coba ubah nomor baris judul.")
         return
+
+    st.caption("Isi sheet yang terbaca (judul kolom dan 5 baris pertama). Pastikan ini tabel BOM Anda:")
+    st.dataframe(raw.head(5), hide_index=True)
 
     def tebak(kunci):
         for cand in TEBAKAN[kunci]:
@@ -814,8 +829,27 @@ def halaman_impor(berkas):
                 label + " (opsional)", opsi, index=idx, key=f"peta_{kunci}_{berkas.name}_{sheet}_{hdr}"
             )
 
+    if len({peta[k] for k, _ in WAJIB}) < len(WAJIB):
+        st.error(
+            "Nama menu, yield, nama bahan, dan qty masih memakai kolom yang sama, "
+            "jadi pembacaan belum benar. Periksa pilihan sheet dan nomor baris judul di atas, "
+            "atau pilih kolomnya satu per satu di Pemetaan kolom."
+        )
+        return
+
     awal = int(hdr) + 1  # nomor baris Excel untuk data pertama
-    menus, bahans, resep_rows, masalah, d = siapkan(raw, peta, awal)
+
+    # Banyak BOM hanya mengisi data produk di baris pertama tiap produk
+    menu_kosong = raw[peta["nama_menu"]].map(ke_teks) == ""
+    ada_bahan = raw[peta["nama_bahan"]].map(ke_teks) != ""
+    pola = bool((menu_kosong & ada_bahan).any())
+    isi_bawah = st.checkbox(
+        "Data produk (kode, nama, yield, uom, harga jual) hanya terisi di baris pertama tiap produk. "
+        "Isi otomatis ke baris di bawahnya.",
+        value=pola,
+        key=f"isibawah_{berkas.name}_{sheet}_{hdr}_{pola}",
+    )
+    menus, bahans, resep_rows, masalah, d = siapkan(raw, peta, awal, isi_bawah)
 
     # cocokkan dengan data yang sudah ada di aplikasi
     b_kode = {r.kode: int(r.id) for r in bahan.itertuples() if isinstance(r.kode, str) and r.kode}
