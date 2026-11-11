@@ -1,4 +1,5 @@
 import html
+import re
 from datetime import date
 
 import pandas as pd
@@ -75,12 +76,26 @@ if not st.session_state.get("login"):
 # ---------------------------------------------------------------
 def ambil(tabel, kolom, angka=()):
     """Ambil seluruh isi tabel sebagai DataFrame (tabel di memori)."""
-    try:
-        data = db.table(tabel).select("*").execute().data
-    except Exception as e:
-        if "jwt" in str(e).lower() or "expired" in str(e).lower():
-            keluar("Sesi sudah habis, silakan masuk lagi.")
-        raise
+    data = []
+    mulai = 0
+    while True:  # Supabase membatasi 1000 baris per permintaan, jadi ambil bertahap
+        try:
+            bagian = (
+                db.table(tabel)
+                .select("*")
+                .order("id")
+                .range(mulai, mulai + 999)
+                .execute()
+                .data
+            )
+        except Exception as e:
+            if "jwt" in str(e).lower() or "expired" in str(e).lower():
+                keluar("Sesi sudah habis, silakan masuk lagi.")
+            raise
+        data += bagian
+        if len(bagian) < 1000:
+            break
+        mulai += 1000
     df = pd.DataFrame(data) if data else pd.DataFrame(columns=kolom)
     for k in angka:
         df[k] = pd.to_numeric(df[k])
@@ -110,8 +125,8 @@ def jalankan(aksi, pesan_sukses):
 # ---------------------------------------------------------------
 bahan = ambil(
     "bahan",
-    ["id", "nama_bahan", "satuan", "stok_saat_ini", "stok_minimum"],
-    ["id", "stok_saat_ini", "stok_minimum"],
+    ["id", "nama_bahan", "satuan", "stok_saat_ini", "stok_minimum", "kode", "harga_standar"],
+    ["id", "stok_saat_ini", "stok_minimum", "harga_standar"],
 )
 pembelian = ambil(
     "pembelian",
@@ -120,7 +135,7 @@ pembelian = ambil(
 )
 menu = ambil(
     "menu",
-    ["id", "nama_menu", "harga_jual", "jumlah_porsi_per_resep"],
+    ["id", "nama_menu", "harga_jual", "jumlah_porsi_per_resep", "kode", "satuan_produk"],
     ["id", "harga_jual", "jumlah_porsi_per_resep"],
 )
 resep = ambil(
@@ -149,7 +164,9 @@ if not rendah.empty:
     ]
     st.warning("⚠️ **Stok di bawah minimum:**\n" + "\n".join(baris))
 
-tab1, tab2, tab3 = st.tabs(["📦 Bahan & Pembelian", "📖 Menu & Resep", "📊 Laporan"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📦 Bahan & Pembelian", "📖 Menu & Resep", "📊 Laporan", "📥 Impor Excel"]
+)
 
 # ---------------------------------------------------------------
 # HALAMAN 1: BAHAN & PEMBELIAN
@@ -356,18 +373,32 @@ with tab2:
 with tab3:
     st.subheader("Laporan HPP & margin")
     st.caption(
-        "HPP dihitung dari harga rata-rata seluruh pembelian. "
         f"Kartu merah = margin di bawah {BATAS_MARGIN}%. Urutan dari margin (%) terkecil."
     )
 
     if menu.empty:
-        st.info("Belum ada menu. Tambahkan dulu di halaman Menu & Resep.")
+        st.info("Belum ada menu. Tambahkan di halaman Menu & Resep, atau impor dari Excel.")
     else:
+        sumber = st.radio(
+            "Sumber harga bahan",
+            ["Pembelian (jika ada), kalau belum ada pakai harga BOM", "Harga BOM saja"],
+        )
+
         # harga rata-rata per satuan bahan = total uang / total jumlah dibeli
-        harga_satuan = {}
+        harga_beli = {}
         if not pembelian.empty:
             ringkas = pembelian.groupby("id_bahan")[["total_harga", "jumlah"]].sum()
-            harga_satuan = (ringkas["total_harga"] / ringkas["jumlah"]).to_dict()
+            rata = ringkas["total_harga"] / ringkas["jumlah"]
+            harga_beli = {int(k): float(v) for k, v in rata.items()}
+        harga_bom = {
+            int(r.id): float(r.harga_standar)
+            for r in bahan.itertuples()
+            if pd.notna(r.harga_standar)
+        }
+        if sumber.startswith("Harga BOM"):
+            harga_satuan = harga_bom
+        else:
+            harga_satuan = {**harga_bom, **harga_beli}
 
         hasil = []
         for m in menu.itertuples():
@@ -375,7 +406,7 @@ with tab3:
             biaya = 0.0
             ada_bahan_tanpa_harga = False
             for b in baris_resep.itertuples():
-                h = harga_satuan.get(b.id_bahan)
+                h = harga_satuan.get(int(b.id_bahan))
                 if h is None:
                     ada_bahan_tanpa_harga = True
                 else:
@@ -385,20 +416,48 @@ with tab3:
             margin_rp = m.harga_jual - hpp
             margin_pct = (margin_rp / m.harga_jual * 100) if m.harga_jual > 0 else 0
 
-            catatan = ""
+            catatan = []
             if baris_resep.empty:
-                catatan = "Resep belum diisi."
+                catatan.append("Resep belum diisi.")
             elif ada_bahan_tanpa_harga:
-                catatan = "Ada bahan yang belum pernah dicatat pembeliannya, HPP bisa terlalu kecil."
+                catatan.append(
+                    "Ada bahan tanpa harga (belum ada pembelian atau harga BOM), "
+                    "HPP bisa terlalu kecil."
+                )
+            if m.harga_jual <= 0:
+                catatan.append("Harga jual belum diisi.")
 
-            hasil.append((m.nama_menu, m.harga_jual, hpp, margin_rp, margin_pct, catatan))
+            satuan = (
+                m.satuan_produk
+                if isinstance(m.satuan_produk, str) and m.satuan_produk.strip()
+                else "porsi"
+            )
+            kode_m = m.kode if isinstance(m.kode, str) else ""
+            hasil.append(
+                (m.nama_menu, kode_m, m.harga_jual, hpp, margin_rp, margin_pct, " ".join(catatan), satuan)
+            )
 
-        hasil.sort(key=lambda x: x[4])  # margin % terkecil di atas
+        hasil.sort(key=lambda x: x[5])  # margin % terkecil di atas
 
-        jumlah_merah = sum(1 for x in hasil if x[4] < BATAS_MARGIN)
+        jumlah_merah = sum(1 for x in hasil if x[5] < BATAS_MARGIN)
         st.metric("Menu dengan margin rendah", f"{jumlah_merah} dari {len(hasil)}")
 
-        for nama_m, hj, hpp, mrp, mpct, catatan in hasil:
+        cari = st.text_input("Cari menu", placeholder="Ketik sebagian nama atau kode menu")
+        hanya_merah = st.checkbox(f"Hanya tampilkan margin di bawah {BATAS_MARGIN}%")
+        batas_tampil = st.selectbox("Jumlah kartu ditampilkan", ["25", "50", "100", "Semua"])
+
+        tampil = [
+            x
+            for x in hasil
+            if (not cari or cari.lower() in f"{x[0]} {x[1]}".lower())
+            and (not hanya_merah or x[5] < BATAS_MARGIN)
+        ]
+        total_cocok = len(tampil)
+        if batas_tampil != "Semua":
+            tampil = tampil[: int(batas_tampil)]
+        st.caption(f"Menampilkan {len(tampil)} dari {total_cocok} menu.")
+
+        for nama_m, kode_m, hj, hpp, mrp, mpct, catatan, satuan in tampil:
             merah = mpct < BATAS_MARGIN
             warna_bg = "#fdecea" if merah else "#eef7ee"
             warna_garis = "#d93025" if merah else "#2e7d32"
@@ -407,16 +466,433 @@ with tab3:
                 if catatan
                 else ""
             )
+            teks_kode = (
+                f" <span style='font-size:0.8rem;color:#666'>({html.escape(kode_m)})</span>"
+                if kode_m
+                else ""
+            )
             kartu = (
                 f"<div style='background:{warna_bg};border-left:6px solid {warna_garis};"
                 f"padding:12px 14px;border-radius:10px;margin-bottom:10px;color:#222'>"
-                f"<b style='font-size:1.05rem'>{html.escape(nama_m)}</b><br>"
+                f"<b style='font-size:1.05rem'>{html.escape(nama_m)}</b>{teks_kode}<br>"
                 f"Harga jual: {rp(hj)}<br>"
-                f"HPP per porsi: {rp(hpp)}<br>"
+                f"HPP per {html.escape(satuan)}: {rp(hpp)}<br>"
                 f"Margin: <b>{rp(mrp)} ({mpct:.1f}%)</b>"
                 f"{teks_catatan}</div>"
             )
             st.markdown(kartu, unsafe_allow_html=True)
+
+# ---------------------------------------------------------------
+# HALAMAN 4: IMPOR EXCEL (BOM)
+# ---------------------------------------------------------------
+TIDAK = "(tidak ada)"
+
+# Tebakan nama judul kolom (huruf kecil, tanpa spasi dan simbol)
+TEBAKAN = {
+    "kode_menu": ["kodeproduk", "kodemenu"],
+    "nama_menu": ["namaproduk", "namamenu"],
+    "satuan_produk": ["uom", "satuan"],
+    "yield": ["yield", "hasil"],
+    "kode_bahan": ["kodebahan", "kodematerial", "kodekomponen"],
+    "nama_bahan": ["namabahan", "namamaterial", "namakomponen"],
+    "qty": ["qtyused", "qty", "jumlah"],
+    "harga": ["harga", "price"],
+    "harga_jual": ["hargajual", "jual", "sellingprice"],
+}
+
+
+def norm(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def ke_teks(x):
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    if isinstance(x, float) and x.is_integer():
+        return str(int(x))
+    return str(x).strip()
+
+
+def ke_angka(x):
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip().replace("Rp", "").replace("rp", "").replace(" ", "")
+    if s == "" or s.lower() == "nan":
+        return None
+    if re.fullmatch(r"\d{1,3}(\.\d{3})+", s):  # contoh teks "12.000" = dua belas ribu
+        s = s.replace(".", "")
+    elif "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def potong(daftar, n):
+    for i in range(0, len(daftar), n):
+        yield daftar[i : i + n]
+
+
+def pertama(seri):
+    for x in seri:
+        if x:
+            return x
+    return ""
+
+
+def siapkan(raw, peta, awal):
+    """Baca isi Excel jadi daftar menu, bahan, dan baris resep + daftar masalah."""
+    n = len(raw)
+
+    def kol(kunci, fungsi, kosong):
+        k = peta[kunci]
+        if k == TIDAK:
+            return pd.Series([kosong] * n, index=raw.index)
+        return raw[k].map(fungsi)
+
+    d = pd.DataFrame(
+        {
+            "baris": raw.index + awal,
+            "kode_menu": kol("kode_menu", ke_teks, ""),
+            "nama_menu": kol("nama_menu", ke_teks, ""),
+            "satuan_produk": kol("satuan_produk", ke_teks, ""),
+            "yield_": kol("yield", ke_angka, None),
+            "kode_bahan": kol("kode_bahan", ke_teks, ""),
+            "nama_bahan": kol("nama_bahan", ke_teks, ""),
+            "qty": kol("qty", ke_angka, None),
+            "harga": kol("harga", ke_angka, None),
+            "harga_jual": kol("harga_jual", ke_angka, None),
+        }
+    )
+    for k in ["yield_", "qty", "harga", "harga_jual"]:
+        d[k] = pd.to_numeric(d[k], errors="coerce")
+
+    masalah = []
+
+    # baris kosong total dibuang diam-diam
+    d = d[~((d["nama_menu"] == "") & (d["nama_bahan"] == ""))]
+
+    salah_nama = (d["nama_menu"] == "") | (d["nama_bahan"] == "")
+    for r in d[salah_nama].itertuples():
+        masalah.append(("Baris dilewati", int(r.baris), "Nama menu atau nama bahan kosong"))
+    d = d[~salah_nama]
+
+    qty_salah = d["qty"].isna() | (d["qty"] <= 0)
+    for r in d[qty_salah].itertuples():
+        masalah.append(("Baris dilewati", int(r.baris), f"{r.nama_menu} / {r.nama_bahan}: qty kosong, bukan angka, atau 0"))
+    d = d[~qty_salah].copy()
+
+    d["km"] = [k if k else nm.lower() for k, nm in zip(d["kode_menu"], d["nama_menu"])]
+    d["kb"] = [k if k else nb.lower() for k, nb in zip(d["kode_bahan"], d["nama_bahan"])]
+
+    # ---- menu ----
+    menus, menu_ok = [], set()
+    for km, g in d.groupby("km", sort=False):
+        nama = g["nama_menu"].iloc[0]
+        baris0 = int(g["baris"].iloc[0])
+        y = g["yield_"].dropna()
+        y = y[y > 0]
+        if y.empty:
+            masalah.append(("Menu dilewati", baris0, f"{nama}: yield kosong atau 0"))
+            continue
+        if y.nunique() > 1:
+            masalah.append(("Periksa", baris0, f"{nama}: yield berbeda antar baris ({y.min():g} sampai {y.max():g}), dipakai {y.iloc[0]:g}"))
+        hj = g["harga_jual"].dropna()
+        hj = hj[hj >= 0]
+        if hj.nunique() > 1:
+            masalah.append(("Periksa", baris0, f"{nama}: harga jual berbeda antar baris ({hj.min():g} sampai {hj.max():g}), dipakai {hj.iloc[0]:g}"))
+        menus.append(
+            {
+                "key": km,
+                "kode": pertama(g["kode_menu"]),
+                "nama": nama,
+                "satuan": pertama(g["satuan_produk"]),
+                "yield": float(y.iloc[0]),
+                "harga_jual": float(hj.iloc[0]) if not hj.empty else None,
+            }
+        )
+        menu_ok.add(km)
+
+    d = d[d["km"].isin(menu_ok)]
+
+    # ---- baris resep ----
+    resep_rows = []
+    for (km, kb), g in d.groupby(["km", "kb"], sort=False):
+        if len(g) > 1:
+            masalah.append(("Periksa", int(g["baris"].iloc[0]), f"{g['nama_menu'].iloc[0]} / {g['nama_bahan'].iloc[0]}: bahan muncul {len(g)} kali, qty dijumlahkan"))
+        resep_rows.append({"km": km, "kb": kb, "qty": float(g["qty"].sum())})
+
+    # ---- bahan ----
+    bahans = []
+    for kb, g in d.groupby("kb", sort=False):
+        nama = g["nama_bahan"].iloc[0]
+        harga = g["harga"].dropna()
+        harga = harga[harga >= 0]
+        if harga.nunique() > 1:
+            masalah.append(("Periksa", int(g["baris"].iloc[0]), f"{nama}: harga berbeda antar baris ({harga.min():g} sampai {harga.max():g}), dipakai harga terakhir {harga.iloc[-1]:g}"))
+        bahans.append(
+            {
+                "key": kb,
+                "kode": pertama(g["kode_bahan"]),
+                "nama": nama,
+                "harga": float(harga.iloc[-1]) if not harga.empty else None,
+            }
+        )
+
+    return menus, bahans, resep_rows, masalah, d
+
+
+def simpan_impor(menus, bahans, resep_rows, ganti):
+    """Simpan hasil bacaan Excel ke Supabase secara bertahap."""
+    bar = st.progress(0.0, text="Menyimpan bahan...")
+    for b in bahans:
+        b["baru"] = b["id"] is None
+    for m in menus:
+        m["baru"] = m["id"] is None
+    ada_b = {int(r.id): r for r in bahan.itertuples()}
+    ada_m = {int(r.id): r for r in menu.itertuples()}
+
+    # 1. bahan baru
+    baru_b = [b for b in bahans if b["baru"]]
+    for bagian in potong(baru_b, 200):
+        rows = [
+            {
+                "kode": b["kode"] or None,
+                "nama_bahan": b["nama"],
+                "satuan": "unit",
+                "stok_saat_ini": 0,
+                "stok_minimum": 0,
+                "harga_standar": b["harga"],
+            }
+            for b in bagian
+        ]
+        hasil_insert = db.table("bahan").insert(rows).execute().data
+        for b, h in zip(bagian, hasil_insert):
+            b["id"] = int(h["id"])
+
+    # 2. bahan lama: perbarui harga standar dan kode jika perlu
+    for b in bahans:
+        if b["baru"]:
+            continue
+        lama = ada_b[b["id"]]
+        ubah = {}
+        if b["harga"] is not None and (pd.isna(lama.harga_standar) or float(lama.harga_standar) != b["harga"]):
+            ubah["harga_standar"] = b["harga"]
+        if b["kode"] and not (isinstance(lama.kode, str) and lama.kode):
+            ubah["kode"] = b["kode"]
+        if ubah:
+            db.table("bahan").update(ubah).eq("id", b["id"]).execute()
+    bar.progress(0.3, text="Menyimpan menu...")
+
+    # 3. menu baru
+    baru_m = [m for m in menus if m["baru"]]
+    for bagian in potong(baru_m, 200):
+        rows = [
+            {
+                "kode": m["kode"] or None,
+                "nama_menu": m["nama"],
+                "harga_jual": m["harga_jual"] if m["harga_jual"] is not None else 0,
+                "jumlah_porsi_per_resep": m["yield"],
+                "satuan_produk": m["satuan"] or None,
+            }
+            for m in bagian
+        ]
+        hasil_insert = db.table("menu").insert(rows).execute().data
+        for m, h in zip(bagian, hasil_insert):
+            m["id"] = int(h["id"])
+
+    # 4. menu lama: perbarui hanya jika mode "Perbarui"
+    lama_m = [m for m in menus if not m["baru"]]
+    if ganti:
+        for m in lama_m:
+            lama = ada_m[m["id"]]
+            ubah = {"jumlah_porsi_per_resep": m["yield"]}
+            if m["satuan"]:
+                ubah["satuan_produk"] = m["satuan"]
+            if m["harga_jual"] is not None:
+                ubah["harga_jual"] = m["harga_jual"]
+            if m["kode"] and not (isinstance(lama.kode, str) and lama.kode):
+                ubah["kode"] = m["kode"]
+            db.table("menu").update(ubah).eq("id", m["id"]).execute()
+    bar.progress(0.6, text="Menyimpan resep...")
+
+    # 5. resep: hapus resep lama menu yang diperbarui, lalu isi dari Excel
+    id_menu = {m["key"]: m["id"] for m in baru_m}
+    if ganti:
+        id_menu.update({m["key"]: m["id"] for m in lama_m})
+        for bagian in potong([m["id"] for m in lama_m], 100):
+            db.table("resep").delete().in_("id_menu", bagian).execute()
+    id_bahan = {b["key"]: b["id"] for b in bahans}
+    rows = [
+        {"id_menu": id_menu[r["km"]], "id_bahan": id_bahan[r["kb"]], "jumlah_dipakai": r["qty"]}
+        for r in resep_rows
+        if r["km"] in id_menu
+    ]
+    for i, bagian in enumerate(potong(rows, 500)):
+        db.table("resep").insert(bagian).execute()
+    bar.progress(1.0, text="Selesai")
+    return len(baru_b), len(baru_m), len(rows)
+
+
+def halaman_impor(berkas):
+    try:
+        xls = pd.ExcelFile(berkas)
+    except Exception:
+        st.error("Berkas tidak bisa dibaca. Pastikan formatnya .xlsx dan tidak diberi kata sandi.")
+        return
+
+    sheet = st.selectbox("Pilih sheet", xls.sheet_names)
+    hdr = st.number_input("Judul kolom ada di baris ke", min_value=1, value=1, step=1)
+    raw = xls.parse(sheet, header=int(hdr) - 1, dtype=object)
+    raw = raw.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    raw.columns = [str(c).strip() for c in raw.columns]
+    kolom = list(raw.columns)
+
+    if raw.empty or not kolom:
+        st.warning("Sheet ini kosong atau judul kolomnya tidak ditemukan. Coba ubah nomor baris judul.")
+        return
+
+    def tebak(kunci):
+        for cand in TEBAKAN[kunci]:
+            for k in kolom:
+                if norm(k) == cand:
+                    return k
+            for k in kolom:
+                n_k = norm(k)
+                if cand in n_k and not (kunci == "harga" and "jual" in n_k):
+                    return k
+        return None
+
+    WAJIB = [
+        ("nama_menu", "Nama menu / produk"),
+        ("yield", "Yield (jumlah hasil per resep)"),
+        ("nama_bahan", "Nama bahan"),
+        ("qty", "Qty dipakai"),
+    ]
+    OPSIONAL = [
+        ("kode_menu", "Kode menu / produk"),
+        ("satuan_produk", "Satuan produk jadi (uom)"),
+        ("kode_bahan", "Kode bahan"),
+        ("harga", "Harga per satuan bahan"),
+        ("harga_jual", "Harga jual menu"),
+    ]
+    peta = {}
+    with st.expander("Pemetaan kolom (periksa, ubah jika perlu)", expanded=True):
+        for kunci, label in WAJIB:
+            tebakan = tebak(kunci)
+            idx = kolom.index(tebakan) if tebakan in kolom else 0
+            peta[kunci] = st.selectbox(
+                label, kolom, index=idx, key=f"peta_{kunci}_{berkas.name}_{sheet}_{hdr}"
+            )
+        for kunci, label in OPSIONAL:
+            opsi = [TIDAK] + kolom
+            tebakan = tebak(kunci)
+            idx = opsi.index(tebakan) if tebakan in opsi else 0
+            peta[kunci] = st.selectbox(
+                label + " (opsional)", opsi, index=idx, key=f"peta_{kunci}_{berkas.name}_{sheet}_{hdr}"
+            )
+
+    awal = int(hdr) + 1  # nomor baris Excel untuk data pertama
+    menus, bahans, resep_rows, masalah, d = siapkan(raw, peta, awal)
+
+    # cocokkan dengan data yang sudah ada di aplikasi
+    b_kode = {r.kode: int(r.id) for r in bahan.itertuples() if isinstance(r.kode, str) and r.kode}
+    b_nama = {r.nama_bahan.strip().lower(): int(r.id) for r in bahan.itertuples()}
+    m_kode = {r.kode: int(r.id) for r in menu.itertuples() if isinstance(r.kode, str) and r.kode}
+    m_nama = {r.nama_menu.strip().lower(): int(r.id) for r in menu.itertuples()}
+    for b in bahans:
+        b["id"] = b_kode.get(b["kode"]) if b["kode"] else None
+        if b["id"] is None:
+            b["id"] = b_nama.get(b["nama"].lower())
+    for m in menus:
+        m["id"] = m_kode.get(m["kode"]) if m["kode"] else None
+        if m["id"] is None:
+            m["id"] = m_nama.get(m["nama"].lower())
+
+    st.markdown("**Pratinjau**")
+    menu_baru = sum(1 for m in menus if m["id"] is None)
+    bahan_baru = sum(1 for b in bahans if b["id"] is None)
+    tanpa_harga = sum(1 for b in bahans if b["harga"] is None)
+    st.dataframe(
+        pd.DataFrame(
+            [
+                ["Menu", len(menus), menu_baru, len(menus) - menu_baru],
+                ["Bahan", len(bahans), bahan_baru, len(bahans) - bahan_baru],
+                ["Baris resep", len(resep_rows), "", ""],
+            ],
+            columns=["Data", "Terbaca", "Baru", "Sudah ada"],
+        ),
+        hide_index=True,
+    )
+    if tanpa_harga:
+        st.warning(f"{tanpa_harga} bahan tidak punya harga di Excel, HPP menu terkait bisa terlalu kecil.")
+    if any(m["harga_jual"] is None for m in menus):
+        st.caption("Menu tanpa harga jual akan disimpan dengan harga 0 dan bisa diisi nanti.")
+
+    if not d.empty:
+        contoh = d.head(8)[["baris", "nama_menu", "yield_", "nama_bahan", "qty", "harga", "harga_jual"]].rename(
+            columns={
+                "baris": "Baris Excel",
+                "nama_menu": "Menu",
+                "yield_": "Yield",
+                "nama_bahan": "Bahan",
+                "qty": "Qty",
+                "harga": "Harga",
+                "harga_jual": "Harga jual",
+            }
+        )
+        st.caption("Contoh hasil pembacaan (cocokkan dengan Excel Anda):")
+        st.dataframe(contoh, hide_index=True)
+
+    if masalah:
+        st.warning(f"Ada {len(masalah)} catatan untuk diperiksa.")
+        st.dataframe(
+            pd.DataFrame(masalah, columns=["Jenis", "Baris Excel", "Keterangan"]).head(200),
+            hide_index=True,
+        )
+
+    mode = st.radio(
+        "Jika menu sudah ada di aplikasi",
+        [
+            "Perbarui: ganti resep lama dengan versi Excel",
+            "Lewati: biarkan menu yang sudah ada",
+        ],
+    )
+    ganti = mode.startswith("Perbarui")
+    siap = len(resep_rows) > 0
+    if not siap:
+        st.error("Belum ada baris resep yang valid. Periksa pemetaan kolom di atas.")
+    if st.button("Simpan semua ke database", type="primary", disabled=not siap):
+        try:
+            n_b, n_m, n_r = simpan_impor(menus, bahans, resep_rows, ganti)
+        except Exception as e:
+            st.error(
+                f"Impor terhenti: {e}. Data yang sudah masuk aman. "
+                "Anda bisa mengulang impor yang sama dengan mode Perbarui."
+            )
+        else:
+            sukses(f"Impor selesai: {n_b} bahan baru, {n_m} menu baru, {n_r} baris resep disimpan.")
+
+
+with tab4:
+    st.subheader("Impor BOM dari Excel")
+    st.caption(
+        "Unggah berkas BOM (.xlsx). Aplikasi membaca isinya, menampilkan pratinjau, "
+        "dan baru menyimpan setelah Anda klik tombol Simpan."
+    )
+    berkas = st.file_uploader("Berkas BOM", type=["xlsx"])
+    if berkas is None:
+        st.info("Belum ada berkas. Siapkan Excel dengan satu baris judul kolom di atas datanya.")
+    else:
+        halaman_impor(berkas)
 
 st.divider()
 if st.button("Keluar"):
