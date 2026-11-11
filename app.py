@@ -17,13 +17,14 @@ SATUAN = ["gram", "kg", "ml", "liter", "pcs", "butir", "bungkus"]
 # ---------------------------------------------------------------
 # SAMBUNGAN KE SUPABASE (kunci dibaca dari st.secrets)
 # ---------------------------------------------------------------
-@st.cache_resource
-def koneksi():
-    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
-
-
 try:
-    db = koneksi()
+    # Satu sambungan per pengunjung (bukan dibagi bersama), supaya
+    # status login tidak tercampur antar pengunjung.
+    if "db" not in st.session_state:
+        st.session_state["db"] = create_client(
+            st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
+        )
+    db = st.session_state["db"]
 except Exception:
     st.error(
         "Kunci Supabase belum terpasang. Isi dulu di menu Secrets "
@@ -32,12 +33,54 @@ except Exception:
     st.stop()
 
 
+def keluar(pesan=None):
+    """Keluar akun: bersihkan status login lalu kembali ke halaman masuk."""
+    try:
+        db.auth.sign_out()
+    except Exception:
+        pass
+    for k in ("login", "db"):
+        st.session_state.pop(k, None)
+    if pesan:
+        st.session_state["info_login"] = pesan
+    st.rerun()
+
+
+def halaman_login():
+    st.title("🍽️ Hitung HPP Menu")
+    st.caption("Silakan masuk untuk membuka data usaha Anda.")
+    if "info_login" in st.session_state:
+        st.warning(st.session_state.pop("info_login"))
+    with st.form("form_login"):
+        email = st.text_input("Email")
+        sandi = st.text_input("Kata sandi", type="password")
+        masuk = st.form_submit_button("Masuk")
+    if masuk:
+        try:
+            db.auth.sign_in_with_password({"email": email.strip(), "password": sandi})
+            st.session_state["login"] = True
+            st.rerun()
+        except Exception:
+            st.error("Email atau kata sandi salah.")
+    st.stop()
+
+
+# Gerbang: tanpa login, halaman di bawah ini tidak akan dijalankan
+if not st.session_state.get("login"):
+    halaman_login()
+
+
 # ---------------------------------------------------------------
 # FUNGSI BANTU
 # ---------------------------------------------------------------
 def ambil(tabel, kolom, angka=()):
     """Ambil seluruh isi tabel sebagai DataFrame (tabel di memori)."""
-    data = db.table(tabel).select("*").execute().data
+    try:
+        data = db.table(tabel).select("*").execute().data
+    except Exception as e:
+        if "jwt" in str(e).lower() or "expired" in str(e).lower():
+            keluar("Sesi sudah habis, silakan masuk lagi.")
+        raise
     df = pd.DataFrame(data) if data else pd.DataFrame(columns=kolom)
     for k in angka:
         df[k] = pd.to_numeric(df[k])
@@ -374,3 +417,7 @@ with tab3:
                 f"{teks_catatan}</div>"
             )
             st.markdown(kartu, unsafe_allow_html=True)
+
+st.divider()
+if st.button("Keluar"):
+    keluar()
