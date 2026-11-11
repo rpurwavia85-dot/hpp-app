@@ -385,6 +385,8 @@ with tab3:
         )
 
         # harga rata-rata per satuan bahan = total uang / total jumlah dibeli
+        sembunyi = st.checkbox("Sembunyikan menu tanpa harga jual", value=True)
+
         harga_beli = {}
         if not pembelian.empty:
             ringkas = pembelian.groupby("id_bahan")[["total_harga", "jumlah"]].sum()
@@ -438,6 +440,12 @@ with tab3:
             )
 
         hasil.sort(key=lambda x: x[5])  # margin % terkecil di atas
+
+        if sembunyi:
+            n_tanpa_jual = sum(1 for x in hasil if x[2] <= 0)
+            hasil = [x for x in hasil if x[2] > 0]
+            if n_tanpa_jual:
+                st.caption(f"{n_tanpa_jual} menu tanpa harga jual disembunyikan.")
 
         jumlah_merah = sum(1 for x in hasil if x[5] < BATAS_MARGIN)
         st.metric("Menu dengan margin rendah", f"{jumlah_merah} dari {len(hasil)}")
@@ -493,7 +501,8 @@ TEBAKAN = {
     "nama_menu": ["namaproduk", "namamenu"],
     "satuan_produk": ["uom", "satuan"],
     "yield": ["yield", "hasil"],
-    "kode_bahan": ["kodebahan", "kodematerial", "kodekomponen"],
+    "kode_bahan": ["kodebahan", "kodeprodukbahan", "kodematerial", "kodekomponen"],
+    "satuan_bahan": ["uombahan", "satuanbahan"],
     "nama_bahan": ["namabahan", "namamaterial", "namakomponen"],
     "qty": ["qtyused", "qty", "jumlah"],
     "harga": ["harga", "price"],
@@ -567,6 +576,7 @@ def siapkan(raw, peta, awal):
             "yield_": kol("yield", ke_angka, None),
             "kode_bahan": kol("kode_bahan", ke_teks, ""),
             "nama_bahan": kol("nama_bahan", ke_teks, ""),
+            "satuan_bahan": kol("satuan_bahan", ke_teks, ""),
             "qty": kol("qty", ke_angka, None),
             "harga": kol("harga", ke_angka, None),
             "harga_jual": kol("harga_jual", ke_angka, None),
@@ -643,6 +653,7 @@ def siapkan(raw, peta, awal):
                 "key": kb,
                 "kode": pertama(g["kode_bahan"]),
                 "nama": nama,
+                "satuan": pertama(g["satuan_bahan"]),
                 "harga": float(harga.iloc[-1]) if not harga.empty else None,
             }
         )
@@ -667,7 +678,7 @@ def simpan_impor(menus, bahans, resep_rows, ganti):
             {
                 "kode": b["kode"] or None,
                 "nama_bahan": b["nama"],
-                "satuan": "unit",
+                "satuan": b["satuan"] or "unit",
                 "stok_saat_ini": 0,
                 "stok_minimum": 0,
                 "harga_standar": b["harga"],
@@ -688,6 +699,8 @@ def simpan_impor(menus, bahans, resep_rows, ganti):
             ubah["harga_standar"] = b["harga"]
         if b["kode"] and not (isinstance(lama.kode, str) and lama.kode):
             ubah["kode"] = b["kode"]
+        if b["satuan"] and lama.satuan == "unit" and b["satuan"] != "unit":
+            ubah["satuan"] = b["satuan"]
         if ubah:
             db.table("bahan").update(ubah).eq("id", b["id"]).execute()
     bar.progress(0.3, text="Menyimpan menu...")
@@ -781,6 +794,7 @@ def halaman_impor(berkas):
         ("kode_menu", "Kode menu / produk"),
         ("satuan_produk", "Satuan produk jadi (uom)"),
         ("kode_bahan", "Kode bahan"),
+        ("satuan_bahan", "Satuan bahan (uom bahan)"),
         ("harga", "Harga per satuan bahan"),
         ("harga_jual", "Harga jual menu"),
     ]
