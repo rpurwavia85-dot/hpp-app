@@ -1,4 +1,5 @@
 import html
+import io
 import re
 from datetime import date
 
@@ -74,20 +75,16 @@ if not st.session_state.get("login"):
 # ---------------------------------------------------------------
 # FUNGSI BANTU
 # ---------------------------------------------------------------
-def ambil(tabel, kolom, angka=()):
+def ambil(tabel, kolom, angka=(), eq=None):
     """Ambil seluruh isi tabel sebagai DataFrame (tabel di memori)."""
     data = []
     mulai = 0
     while True:  # Supabase membatasi 1000 baris per permintaan, jadi ambil bertahap
         try:
-            bagian = (
-                db.table(tabel)
-                .select("*")
-                .order("id")
-                .range(mulai, mulai + 999)
-                .execute()
-                .data
-            )
+            q = db.table(tabel).select("*")
+            if eq:
+                q = q.eq(eq[0], eq[1])
+            bagian = q.order("id").range(mulai, mulai + 999).execute().data
         except Exception as e:
             if "jwt" in str(e).lower() or "expired" in str(e).lower():
                 keluar("Sesi sudah habis, silakan masuk lagi.")
@@ -164,8 +161,8 @@ if not rendah.empty:
     ]
     st.warning("⚠️ **Stok di bawah minimum:**\n" + "\n".join(baris))
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📦 Bahan & Pembelian", "📖 Menu & Resep", "📊 Laporan", "📥 Impor Excel"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📦 Bahan & Pembelian", "📖 Menu & Resep", "📊 Laporan", "📥 Impor Excel", "📸 Riwayat"]
 )
 
 # ---------------------------------------------------------------
@@ -941,6 +938,487 @@ with tab4:
         st.info("Belum ada berkas. Siapkan Excel dengan satu baris judul kolom di atas datanya.")
     else:
         halaman_impor(berkas)
+
+# ---------------------------------------------------------------
+# HALAMAN 5: RIWAYAT HPP BULANAN (SNAPSHOT)
+# ---------------------------------------------------------------
+SUMBER_PEMBELIAN = "Pembelian (jika ada), kalau belum ada pakai harga BOM"
+SUMBER_BOM = "Harga BOM saja"
+
+KOL_SNAP = ["id", "periode", "catatan", "sumber_harga", "dibuat_pada"]
+KOL_SM = ["id", "id_snapshot", "kunci", "kode", "nama_menu", "satuan_produk",
+          "harga_jual", "jumlah_porsi", "hpp", "tanpa_harga"]
+ANGKA_SM = ["id", "id_snapshot", "harga_jual", "jumlah_porsi", "hpp"]
+KOL_SR = ["id", "id_snapshot", "id_snapshot_menu", "kunci_bahan", "kode_bahan",
+          "nama_bahan", "satuan", "jumlah_dipakai", "harga_satuan"]
+ANGKA_SR = ["id", "id_snapshot", "id_snapshot_menu", "jumlah_dipakai", "harga_satuan"]
+
+
+def teks_atau_kosong(x):
+    return x if isinstance(x, str) else ""
+
+
+def harga_aktif(bom_saja):
+    """Harga per satuan tiap bahan: rata-rata pembelian (jika ada) atau harga BOM."""
+    harga_beli = {}
+    if not pembelian.empty:
+        ringkas = pembelian.groupby("id_bahan")[["total_harga", "jumlah"]].sum()
+        rata = ringkas["total_harga"] / ringkas["jumlah"]
+        harga_beli = {int(k): float(v) for k, v in rata.items()}
+    harga_bom = {
+        int(r.id): float(r.harga_standar) for r in bahan.itertuples() if pd.notna(r.harga_standar)
+    }
+    return harga_bom if bom_saja else {**harga_bom, **harga_beli}
+
+
+def susun_snapshot(bom_saja):
+    """Hitung HPP semua menu yang punya resep, lengkap dengan rincian bahannya."""
+    harga = harga_aktif(bom_saja)
+    info_bahan = {int(r.id): r for r in bahan.itertuples()}
+    hasil = []
+    for m in menu.itertuples():
+        baris_resep = resep[resep["id_menu"] == m.id]
+        if baris_resep.empty:
+            continue
+        kode_m = teks_atau_kosong(m.kode)
+        biaya, tanpa, baris = 0.0, False, []
+        for b in baris_resep.itertuples():
+            ib = info_bahan.get(int(b.id_bahan))
+            if ib is None:
+                continue
+            h = harga.get(int(b.id_bahan))
+            if h is None:
+                tanpa = True
+            else:
+                biaya += float(b.jumlah_dipakai) * h
+            kode_b = teks_atau_kosong(ib.kode)
+            baris.append(
+                {
+                    "kunci_bahan": kode_b or ib.nama_bahan.strip().lower(),
+                    "kode_bahan": kode_b or None,
+                    "nama_bahan": ib.nama_bahan,
+                    "satuan": ib.satuan,
+                    "jumlah_dipakai": float(b.jumlah_dipakai),
+                    "harga_satuan": h,
+                }
+            )
+        porsi = float(m.jumlah_porsi_per_resep)
+        hasil.append(
+            {
+                "kunci": kode_m or m.nama_menu.strip().lower(),
+                "kode": kode_m or None,
+                "nama_menu": m.nama_menu,
+                "satuan_produk": teks_atau_kosong(m.satuan_produk) or None,
+                "harga_jual": float(m.harga_jual),
+                "jumlah_porsi": porsi,
+                "hpp": biaya / porsi,
+                "tanpa_harga": tanpa,
+                "baris": baris,
+            }
+        )
+    return hasil
+
+
+def simpan_snapshot(periode, catatan, bom_saja, timpa):
+    menus_s = susun_snapshot(bom_saja)
+    if not menus_s:
+        raise ValueError("Belum ada menu yang memiliki resep.")
+    bar = st.progress(0.0, text="Menyimpan snapshot...")
+    sumber = SUMBER_BOM if bom_saja else SUMBER_PEMBELIAN
+    kepala = (
+        db.table("snapshot")
+        .insert({"periode": periode, "catatan": catatan or None, "sumber_harga": sumber})
+        .execute()
+        .data[0]
+    )
+    id_s = int(kepala["id"])
+    try:
+        for bagian in potong(menus_s, 200):
+            rows = [
+                {
+                    "id_snapshot": id_s,
+                    "kunci": m["kunci"],
+                    "kode": m["kode"],
+                    "nama_menu": m["nama_menu"],
+                    "satuan_produk": m["satuan_produk"],
+                    "harga_jual": m["harga_jual"],
+                    "jumlah_porsi": m["jumlah_porsi"],
+                    "hpp": m["hpp"],
+                    "tanpa_harga": m["tanpa_harga"],
+                }
+                for m in bagian
+            ]
+            keluar_rows = db.table("snapshot_menu").insert(rows).execute().data
+            for m, h in zip(bagian, keluar_rows):
+                m["id_sm"] = int(h["id"])
+        bar.progress(0.5, text="Menyimpan rincian bahan...")
+        baris_semua = [
+            {"id_snapshot": id_s, "id_snapshot_menu": m["id_sm"], **b}
+            for m in menus_s
+            for b in m["baris"]
+        ]
+        for bagian in potong(baris_semua, 500):
+            db.table("snapshot_resep").insert(bagian).execute()
+    except Exception:
+        try:  # batalkan snapshot yang belum lengkap
+            db.table("snapshot").delete().eq("id", id_s).execute()
+        except Exception:
+            pass
+        raise
+    if timpa:  # snapshot baru sudah lengkap, baru hapus yang lama pada periode yang sama
+        db.table("snapshot").delete().eq("periode", periode).neq("id", id_s).execute()
+    bar.progress(1.0, text="Selesai")
+    return len(menus_s), len(baris_semua)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def muat_snapshot(id_s):
+    sm = ambil("snapshot_menu", KOL_SM, ANGKA_SM, eq=("id_snapshot", id_s))
+    sr = ambil("snapshot_resep", KOL_SR, ANGKA_SR, eq=("id_snapshot", id_s))
+    return sm, sr
+
+
+def kumpulkan(sm, sr):
+    """Susun satu snapshot: menu per kunci, dan bahan per menu."""
+    menus_k = {}
+    for r in sm.itertuples():
+        menus_k[r.kunci] = {
+            "id": int(r.id),
+            "kode": teks_atau_kosong(r.kode),
+            "nama": r.nama_menu,
+            "hj": float(r.harga_jual),
+            "porsi": float(r.jumlah_porsi),
+            "hpp": float(r.hpp),
+        }
+    bahan_per_menu = {}
+    for r in sr.itertuples():
+        harga = None if pd.isna(r.harga_satuan) else float(r.harga_satuan)
+        d = bahan_per_menu.setdefault(int(r.id_snapshot_menu), {})
+        e = d.get(r.kunci_bahan)
+        if e is None:
+            d[r.kunci_bahan] = {"nama": r.nama_bahan, "q": float(r.jumlah_dipakai), "p": harga}
+        else:
+            e["q"] += float(r.jumlah_dipakai)
+            if e["p"] is None:
+                e["p"] = harga
+    return menus_k, bahan_per_menu
+
+
+def beda(x, y):
+    return abs(x - y) > 1e-9 * max(1.0, abs(x), abs(y))
+
+
+def bandingkan(a, b):
+    """Bandingkan dua snapshot. Selisih HPP dipecah menjadi efek harga dan efek komposisi."""
+    menus_a, bpm_a = a
+    menus_b, bpm_b = b
+    kunci_semua = list(menus_b) + [k for k in menus_a if k not in menus_b]
+    baris_utama, rincian = [], {}
+    for kunci in kunci_semua:
+        ma, mb = menus_a.get(kunci), menus_b.get(kunci)
+        la = bpm_a.get(ma["id"], {}) if ma else {}
+        lb = bpm_b.get(mb["id"], {}) if mb else {}
+        ya = ma["porsi"] if ma else 1.0
+        yb = mb["porsi"] if mb else 1.0
+        e_harga = e_komp = 0.0
+        detail = []
+        for kb in list(lb) + [k for k in la if k not in lb]:
+            x, y = la.get(kb), lb.get(kb)
+            if x and y:
+                pa, pb = x["p"] or 0.0, y["p"] or 0.0
+                qa, qb = x["q"] / ya, y["q"] / yb
+                d_q, d_p = (qb - qa) * pa, (pb - pa) * qb
+                e_komp += d_q
+                e_harga += d_p
+                ubah_q, ubah_p = beda(qa, qb), beda(pa, pb)
+                jenis = (
+                    "Jumlah dan harga berubah" if ubah_q and ubah_p
+                    else "Jumlah berubah" if ubah_q
+                    else "Harga berubah" if ubah_p
+                    else "Tetap"
+                )
+                detail.append([y["nama"], jenis, x["q"], y["q"], x["p"], y["p"], d_q + d_p])
+            elif y:
+                d = y["q"] / yb * (y["p"] or 0.0)
+                e_komp += d
+                detail.append([y["nama"], "Bahan baru", None, y["q"], None, y["p"], d])
+            else:
+                d = -x["q"] / ya * (x["p"] or 0.0)
+                e_komp += d
+                detail.append([x["nama"], "Bahan dihapus", x["q"], None, x["p"], None, d])
+
+        if ma and mb:
+            selisih = mb["hpp"] - ma["hpp"]
+            persen = selisih / ma["hpp"] * 100 if ma["hpp"] > 0 else None
+            status = "Tetap" if abs(selisih) < 0.005 else ("Naik" if selisih > 0 else "Turun")
+        else:
+            selisih = persen = None
+            status = "Baru" if mb else "Dihapus"
+        ref = mb or ma
+        margin = (mb["hj"] - mb["hpp"]) / mb["hj"] * 100 if mb and mb["hj"] > 0 else None
+        baris_utama.append(
+            {
+                "Menu": ref["nama"],
+                "Kode": ref["kode"],
+                "Status": status,
+                "HPP lama": ma["hpp"] if ma else None,
+                "HPP baru": mb["hpp"] if mb else None,
+                "Selisih (Rp)": selisih,
+                "Selisih (%)": persen,
+                "Efek harga": e_harga if ma and mb else None,
+                "Efek komposisi": e_komp if ma and mb else None,
+                "Harga jual": mb["hj"] if mb else None,
+                "Margin baru (%)": margin,
+                "_kunci": kunci,
+            }
+        )
+        rincian[kunci] = pd.DataFrame(
+            detail,
+            columns=["Bahan", "Perubahan", "Qty lama", "Qty baru", "Harga lama", "Harga baru", "Dampak ke HPP (Rp)"],
+        )
+    df = pd.DataFrame(baris_utama)
+    df = df.sort_values("Selisih (Rp)", ascending=False, na_position="last").reset_index(drop=True)
+    return df, rincian
+
+
+def buat_excel(df, rincian, info):
+    """Buat berkas Excel perbandingan dengan header rapi."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    font_isi = Font(name="DM Sans", size=10)
+    font_head = Font(name="DM Sans", size=10, bold=True, color="1F2937")
+    isi_head = PatternFill("solid", fgColor="E5E7EB")
+    garis = Border(bottom=Side(style="thin", color="9CA3AF"))
+
+    def tulis_tabel(ws, kolom, baris, format_angka):
+        ws.append(kolom)
+        for c in ws[1]:
+            c.font, c.fill, c.border = font_head, isi_head, garis
+            c.alignment = Alignment(vertical="center", wrap_text=True)
+        for r in baris:
+            ws.append([None if (isinstance(v, float) and pd.isna(v)) else v for v in r])
+        for row in ws.iter_rows(min_row=2):
+            for c in row:
+                c.font = font_isi
+                if isinstance(c.value, float):
+                    c.number_format = format_angka
+        for i, k in enumerate(kolom, start=1):
+            lebar = max([len(str(k))] + [len(str(r[i - 1])) for r in baris[:200] if r[i - 1] is not None])
+            ws.column_dimensions[get_column_letter(i)].width = min(max(lebar + 2, 10), 42)
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        ws.row_dimensions[1].height = 22
+
+    wb = Workbook()
+    ws0 = wb.active
+    ws0.title = "Ringkasan"
+    for label, nilai in info:
+        ws0.append([label, nilai])
+    for row in ws0.iter_rows():
+        row[0].font = font_head
+        row[1].font = font_isi
+    ws0.column_dimensions["A"].width = 28
+    ws0.column_dimensions["B"].width = 60
+
+    kolom_utama = [c for c in df.columns if c != "_kunci"]
+    ws1 = wb.create_sheet("Perbandingan")
+    tulis_tabel(ws1, kolom_utama, df[kolom_utama].values.tolist(), "#,##0.00")
+
+    ws2 = wb.create_sheet("Rincian Bahan")
+    baris_r = []
+    for _, r in df.iterrows():
+        if r["Status"] == "Tetap":
+            continue
+        for x in rincian[r["_kunci"]].values.tolist():
+            if x[1] != "Tetap":
+                baris_r.append([r["Menu"], r["Kode"], *x])
+    tulis_tabel(
+        ws2,
+        ["Menu", "Kode", "Bahan", "Perubahan", "Qty lama", "Qty baru", "Harga lama", "Harga baru", "Dampak ke HPP (Rp)"],
+        baris_r,
+        "#,##0.00",
+    )
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+with tab5:
+    st.subheader("Riwayat HPP bulanan")
+    st.caption(
+        "Snapshot adalah foto HPP semua menu pada satu bulan. Simpan setiap kali BOM selesai "
+        "direvisi, lalu bandingkan antar bulan."
+    )
+
+    try:
+        snaps = ambil("snapshot", KOL_SNAP, ["id"])
+        tabel_snap_ada = True
+    except Exception as e:
+        tabel_snap_ada = False
+        st.warning(
+            "Tabel snapshot belum bisa dibaca. Pastikan SQL Tahap A sudah dijalankan di Supabase, "
+            "lalu muat ulang halaman."
+        )
+        st.caption(f"Detail teknis: {e}")
+
+    if tabel_snap_ada:
+        # ---------- simpan snapshot ----------
+        st.markdown("**Simpan snapshot**")
+        periode = st.text_input(
+            "Periode (tahun-bulan)", value=date.today().strftime("%Y-%m"), key="snap_periode"
+        ).strip()
+        catatan_s = st.text_input(
+            "Catatan (opsional)", placeholder="Contoh: Revisi BOM setelah kenaikan harga tepung", key="snap_catatan"
+        ).strip()
+        sumber_s = st.radio("Sumber harga untuk snapshot", [SUMBER_PEMBELIAN, SUMBER_BOM], key="snap_sumber")
+        periode_ok = bool(re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", periode))
+        if not periode_ok:
+            st.error("Format periode harus tahun-bulan, misalnya 2026-11.")
+        sudah_ada = periode_ok and bool((snaps["periode"] == periode).any())
+        timpa = False
+        if sudah_ada:
+            st.warning(f"Snapshot periode {periode} sudah ada.")
+            timpa = st.checkbox("Timpa dengan kondisi terbaru", key="snap_timpa")
+        n_menu_resep = int(resep["id_menu"].nunique()) if not resep.empty else 0
+        st.caption(f"Akan menyimpan {n_menu_resep} menu yang memiliki resep.")
+        bisa = periode_ok and (not sudah_ada or timpa) and n_menu_resep > 0
+        if st.button("Simpan snapshot sekarang", type="primary", disabled=not bisa, key="snap_simpan"):
+            try:
+                n_m, n_r = simpan_snapshot(periode, catatan_s, sumber_s == SUMBER_BOM, timpa)
+            except Exception as e:
+                st.error(f"Snapshot gagal disimpan: {e}. Silakan coba lagi.")
+            else:
+                muat_snapshot.clear()
+                sukses(f"Snapshot {periode} tersimpan: {n_m} menu, {n_r} baris bahan.")
+
+        # ---------- daftar snapshot ----------
+        st.divider()
+        st.markdown("**Daftar snapshot**")
+        if snaps.empty:
+            st.caption("Belum ada snapshot.")
+        else:
+            snaps = snaps.sort_values(["periode", "id"], ascending=False)
+            tampil_s = pd.DataFrame(
+                {
+                    "Periode": snaps["periode"],
+                    "Dibuat": snaps["dibuat_pada"].astype(str).str[:16].str.replace("T", " "),
+                    "Sumber harga": snaps["sumber_harga"],
+                    "Catatan": snaps["catatan"],
+                }
+            )
+            st.dataframe(tampil_s, hide_index=True)
+            label_s = {
+                f"{r.periode} (#{int(r.id)}, dibuat {str(r.dibuat_pada)[:10]})": int(r.id)
+                for r in snaps.itertuples()
+            }
+            with st.expander("Hapus snapshot"):
+                pilih_hapus = st.selectbox("Pilih snapshot", list(label_s), key="snap_hapus")
+                yakin = st.checkbox("Saya yakin, snapshot ini akan hilang permanen", key="snap_yakin")
+                if st.button("Hapus snapshot ini", disabled=not yakin, key="snap_btn_hapus"):
+                    muat_snapshot.clear()
+                    jalankan(
+                        lambda: db.table("snapshot").delete().eq("id", label_s[pilih_hapus]).execute(),
+                        "Snapshot dihapus.",
+                    )
+
+            # ---------- bandingkan ----------
+            st.divider()
+            st.markdown("**Bandingkan dua snapshot**")
+            if len(snaps) < 2:
+                st.info("Perlu minimal dua snapshot untuk membandingkan.")
+            else:
+                opsi = list(label_s)
+                lama = st.selectbox("Snapshot lama (pembanding)", opsi, index=1, key="cmp_lama")
+                baru = st.selectbox("Snapshot baru", opsi, index=0, key="cmp_baru")
+                if lama == baru:
+                    st.warning("Pilih dua snapshot yang berbeda.")
+                else:
+                    id_lama, id_baru = label_s[lama], label_s[baru]
+                    sumber_map = {int(r.id): r.sumber_harga for r in snaps.itertuples()}
+                    if sumber_map[id_lama] != sumber_map[id_baru]:
+                        st.warning(
+                            "Kedua snapshot memakai sumber harga yang berbeda, jadi selisih HPP "
+                            "ikut dipengaruhi perbedaan itu."
+                        )
+                    df_cmp, rincian = bandingkan(
+                        kumpulkan(*muat_snapshot(id_lama)), kumpulkan(*muat_snapshot(id_baru))
+                    )
+                    hitung = df_cmp["Status"].value_counts().to_dict()
+                    st.markdown(
+                        f"**{hitung.get('Naik', 0)}** menu naik, **{hitung.get('Turun', 0)}** turun, "
+                        f"**{hitung.get('Tetap', 0)}** tetap, **{hitung.get('Baru', 0)}** baru, "
+                        f"**{hitung.get('Dihapus', 0)}** dihapus."
+                    )
+                    f_status = st.selectbox(
+                        "Tampilkan", ["Semua", "Naik", "Turun", "Tetap", "Baru", "Dihapus"], key="cmp_status"
+                    )
+                    f_cari = st.text_input("Cari menu", placeholder="Nama atau kode menu", key="cmp_cari")
+                    df_tampil = df_cmp
+                    if f_status != "Semua":
+                        df_tampil = df_tampil[df_tampil["Status"] == f_status]
+                    if f_cari:
+                        gabung_teks = (df_tampil["Menu"] + " " + df_tampil["Kode"]).str.lower()
+                        df_tampil = df_tampil[gabung_teks.str.contains(f_cari.lower(), regex=False)]
+                    kolom_angka = ["HPP lama", "HPP baru", "Selisih (Rp)", "Efek harga", "Efek komposisi", "Harga jual"]
+                    konfigurasi = {c: st.column_config.NumberColumn(c, format="%.2f") for c in kolom_angka}
+                    konfigurasi["Selisih (%)"] = st.column_config.NumberColumn("Selisih (%)", format="%.1f")
+                    konfigurasi["Margin baru (%)"] = st.column_config.NumberColumn("Margin baru (%)", format="%.1f")
+                    st.caption(
+                        f"Menampilkan {len(df_tampil)} dari {len(df_cmp)} menu, diurutkan dari kenaikan HPP terbesar. "
+                        "Efek harga = dampak perubahan harga bahan. Efek komposisi = dampak bahan ditambah, "
+                        "dibuang, atau jumlahnya berubah."
+                    )
+                    st.dataframe(
+                        df_tampil.drop(columns="_kunci"), hide_index=True, column_config=konfigurasi
+                    )
+
+                    # penyebab perubahan per menu
+                    adaperubahan = df_tampil[df_tampil["Status"].isin(["Naik", "Turun", "Tetap"])]
+                    if not adaperubahan.empty:
+                        label_menu_cmp = {
+                            (f"{r['Menu']} ({r['Kode']})" if r["Kode"] else r["Menu"]): r["_kunci"]
+                            for _, r in adaperubahan.iterrows()
+                        }
+                        pilih_menu_cmp = st.selectbox(
+                            "Lihat penyebab perubahan menu", list(label_menu_cmp), key="cmp_detail"
+                        )
+                        baris_pilih = df_cmp[df_cmp["_kunci"] == label_menu_cmp[pilih_menu_cmp]].iloc[0]
+                        st.markdown(
+                            f"HPP **{rp(baris_pilih['HPP lama'])}** menjadi **{rp(baris_pilih['HPP baru'])}**. "
+                            f"Efek harga bahan **{rp(baris_pilih['Efek harga'])}**, "
+                            f"efek komposisi **{rp(baris_pilih['Efek komposisi'])}**."
+                        )
+                        det = rincian[label_menu_cmp[pilih_menu_cmp]]
+                        st.dataframe(
+                            det[det["Perubahan"] != "Tetap"],
+                            hide_index=True,
+                            column_config={
+                                c: st.column_config.NumberColumn(c, format="%.2f")
+                                for c in ["Qty lama", "Qty baru", "Harga lama", "Harga baru", "Dampak ke HPP (Rp)"]
+                            },
+                        )
+
+                    info_excel = [
+                        ("Snapshot lama", lama),
+                        ("Snapshot baru", baru),
+                        ("Sumber harga lama", sumber_map[id_lama]),
+                        ("Sumber harga baru", sumber_map[id_baru]),
+                        ("Menu naik", hitung.get("Naik", 0)),
+                        ("Menu turun", hitung.get("Turun", 0)),
+                        ("Menu tetap", hitung.get("Tetap", 0)),
+                        ("Menu baru", hitung.get("Baru", 0)),
+                        ("Menu dihapus", hitung.get("Dihapus", 0)),
+                        ("Catatan", "Efek harga = dampak perubahan harga bahan. Efek komposisi = dampak bahan ditambah, dibuang, atau jumlah/yield berubah."),
+                    ]
+                    st.download_button(
+                        "Unduh perbandingan (Excel)",
+                        data=buat_excel(df_cmp, rincian, info_excel),
+                        file_name=f"perbandingan_hpp_{lama[:7]}_vs_{baru[:7]}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
 
 st.divider()
 if st.button("Keluar"):
