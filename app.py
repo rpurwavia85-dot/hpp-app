@@ -103,6 +103,42 @@ def rp(x):
     return "Rp " + f"{x:,.0f}".replace(",", ".")
 
 
+def teks_atau_kosong(x):
+    return x if isinstance(x, str) else ""
+
+
+def buat_csv(daftar, excel_indonesia=True):
+    """Ubah daftar menu laporan menjadi berkas CSV (bytes).
+
+    excel_indonesia=True : pemisah titik koma dan desimal koma, langsung rapi di Excel Indonesia.
+    excel_indonesia=False: pemisah koma dan desimal titik (format standar).
+    """
+    df = pd.DataFrame(
+        [
+            {
+                "Kode": kode_m,
+                "Menu": nama_m,
+                "Satuan produk": satuan,
+                "Harga jual": round(hj, 2),
+                "HPP per satuan": round(hpp, 2),
+                "Margin (Rp)": round(mrp, 2),
+                "Margin (%)": round(mpct, 1),
+                "Status margin": (
+                    f"Di bawah {BATAS_MARGIN}%" if mpct < BATAS_MARGIN else f"{BATAS_MARGIN}% atau lebih"
+                ),
+                "Catatan": catatan,
+            }
+            for nama_m, kode_m, hj, hpp, mrp, mpct, catatan, satuan in daftar
+        ]
+    )
+    teks = df.to_csv(
+        index=False,
+        sep=";" if excel_indonesia else ",",
+        decimal="," if excel_indonesia else ".",
+    )
+    return teks.encode("utf-8-sig")  # tanda BOM agar huruf dan simbol terbaca benar di Excel
+
+
 def sukses(pesan):
     st.session_state["pesan"] = pesan
     st.rerun()
@@ -400,6 +436,7 @@ with tab3:
             harga_satuan = {**harga_bom, **harga_beli}
 
         hasil = []
+        margin_per_id = {}
         for m in menu.itertuples():
             baris_resep = resep[resep["id_menu"] == m.id]
             biaya = 0.0
@@ -414,6 +451,7 @@ with tab3:
             hpp = biaya / m.jumlah_porsi_per_resep
             margin_rp = m.harga_jual - hpp
             margin_pct = (margin_rp / m.harga_jual * 100) if m.harga_jual > 0 else 0
+            margin_per_id[int(m.id)] = margin_pct
 
             catatan = []
             if baris_resep.empty:
@@ -425,6 +463,11 @@ with tab3:
                 )
             if m.harga_jual <= 0:
                 catatan.append("Harga jual belum diisi.")
+            elif hpp > 3 * m.harga_jual:
+                catatan.append(
+                    "HPP lebih dari 3x harga jual. Periksa kesesuaian satuan qty dan harga bahan "
+                    "(misalnya gram dengan kg)."
+                )
 
             satuan = (
                 m.satuan_produk
@@ -446,6 +489,12 @@ with tab3:
 
         jumlah_merah = sum(1 for x in hasil if x[5] < BATAS_MARGIN)
         st.metric("Menu dengan margin rendah", f"{jumlah_merah} dari {len(hasil)}")
+        n_janggal = sum(1 for x in hasil if x[2] > 0 and x[3] > 3 * x[2])
+        if n_janggal:
+            st.warning(
+                f"{n_janggal} menu memiliki HPP lebih dari 3x harga jual. Kemungkinan satuan qty dan harga "
+                "bahan tidak sejalan. Periksa lewat Rincian biaya di bawah."
+            )
 
         cari = st.text_input("Cari menu", placeholder="Ketik sebagian nama atau kode menu")
         hanya_merah = st.checkbox(f"Hanya tampilkan margin di bawah {BATAS_MARGIN}%")
@@ -457,10 +506,79 @@ with tab3:
             if (not cari or cari.lower() in f"{x[0]} {x[1]}".lower())
             and (not hanya_merah or x[5] < BATAS_MARGIN)
         ]
+        semua_cocok = tampil  # untuk CSV: seluruh menu yang cocok dengan filter, bukan hanya yang tampil
         total_cocok = len(tampil)
         if batas_tampil != "Semua":
             tampil = tampil[: int(batas_tampil)]
         st.caption(f"Menampilkan {len(tampil)} dari {total_cocok} menu.")
+
+        if semua_cocok:
+            format_csv = st.radio(
+                "Format CSV",
+                [
+                    "Excel Indonesia (pemisah titik koma, desimal koma)",
+                    "Standar (pemisah koma, desimal titik)",
+                ],
+                key="format_csv",
+            )
+            nama_csv = "margin_di_bawah_%d" % BATAS_MARGIN if hanya_merah else "laporan_margin"
+            st.download_button(
+                f"Unduh CSV ({total_cocok} menu)",
+                data=buat_csv(semua_cocok, format_csv.startswith("Excel Indonesia")),
+                file_name=f"{nama_csv}_{date.today():%Y%m%d}.csv",
+                mime="text/csv",
+            )
+
+        with st.expander("Rincian biaya per menu (untuk memeriksa angka)"):
+            label_detail = {}
+            for r in menu.itertuples():
+                if (resep["id_menu"] == r.id).any():
+                    kode_r = r.kode if isinstance(r.kode, str) and r.kode else ""
+                    label_detail[f"{r.nama_menu} ({kode_r})" if kode_r else r.nama_menu] = int(r.id)
+            if not label_detail:
+                st.caption("Belum ada menu yang memiliki resep.")
+            else:
+                urut_detail = sorted(label_detail, key=lambda k: margin_per_id.get(label_detail[k], 0))
+                pilih_d = st.selectbox(
+                    "Pilih menu (diurutkan dari margin terendah)", urut_detail, key="detail_hpp_menu"
+                )
+                id_d = label_detail[pilih_d]
+                m_d = menu[menu["id"] == id_d].iloc[0]
+                bahan_kecil = bahan[["id", "nama_bahan", "kode", "satuan"]].rename(columns={"id": "id_bahan"})
+                baris_d = resep[resep["id_menu"] == id_d].merge(bahan_kecil, on="id_bahan")
+                isi_d = []
+                for b in baris_d.itertuples():
+                    idb = int(b.id_bahan)
+                    if not sumber.startswith("Harga BOM") and idb in harga_beli:
+                        h_d, asal = harga_beli[idb], "Pembelian"
+                    elif idb in harga_bom:
+                        h_d, asal = harga_bom[idb], "BOM"
+                    else:
+                        h_d, asal = None, "Tidak ada"
+                    biaya_d = float(b.jumlah_dipakai) * h_d if h_d is not None else 0.0
+                    isi_d.append([b.nama_bahan, teks_atau_kosong(b.kode), float(b.jumlah_dipakai), b.satuan, h_d, asal, biaya_d])
+                df_d = pd.DataFrame(
+                    isi_d, columns=["Bahan", "Kode", "Qty", "Satuan", "Harga per satuan", "Sumber harga", "Biaya"]
+                )
+                total_d = df_d["Biaya"].sum()
+                df_d["% dari total"] = df_d["Biaya"] / total_d * 100 if total_d > 0 else 0.0
+                df_d = df_d.sort_values("Biaya", ascending=False)
+                st.dataframe(
+                    df_d,
+                    hide_index=True,
+                    column_config={
+                        "Qty": st.column_config.NumberColumn("Qty", format="%.4f"),
+                        "Harga per satuan": st.column_config.NumberColumn("Harga per satuan", format="%.4f"),
+                        "Biaya": st.column_config.NumberColumn("Biaya", format="%.2f"),
+                        "% dari total": st.column_config.NumberColumn("% dari total", format="%.1f"),
+                    },
+                )
+                porsi_d = float(m_d["jumlah_porsi_per_resep"])
+                st.markdown(
+                    f"Total biaya bahan **{rp(total_d)}** dibagi yield **{porsi_d:g}** = "
+                    f"HPP **{rp(total_d / porsi_d)}** per satuan produk. "
+                    "Biaya terbesar ada di baris paling atas, periksa qty dan harga baris itu."
+                )
 
         for nama_m, kode_m, hj, hpp, mrp, mpct, catatan, satuan in tampil:
             merah = mpct < BATAS_MARGIN
@@ -519,7 +637,8 @@ def ke_teks(x):
     return str(x).strip()
 
 
-def ke_angka(x):
+def ke_angka(x, gaya="id"):
+    """gaya "id": titik = ribuan, koma = desimal. gaya "en": titik = desimal, koma = ribuan."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
     if isinstance(x, (int, float)):
@@ -527,6 +646,11 @@ def ke_angka(x):
     s = str(x).strip().replace("Rp", "").replace("rp", "").replace(" ", "")
     if s == "" or s.lower() == "nan":
         return None
+    if gaya == "en":
+        try:
+            return float(s.replace(",", ""))
+        except ValueError:
+            return None
     if re.fullmatch(r"\d{1,3}(\.\d{3})+", s):  # contoh teks "12.000" = dua belas ribu
         s = s.replace(".", "")
     elif "," in s and "." in s:
@@ -554,9 +678,12 @@ def pertama(seri):
     return ""
 
 
-def siapkan(raw, peta, awal, isi_bawah=False):
+def siapkan(raw, peta, awal, isi_bawah=False, gaya_angka="id"):
     """Baca isi Excel jadi daftar menu, bahan, dan baris resep + daftar masalah."""
     n = len(raw)
+
+    def angka(v):
+        return ke_angka(v, gaya_angka)
 
     def kol(kunci, fungsi, kosong):
         k = peta[kunci]
@@ -570,13 +697,13 @@ def siapkan(raw, peta, awal, isi_bawah=False):
             "kode_menu": kol("kode_menu", ke_teks, ""),
             "nama_menu": kol("nama_menu", ke_teks, ""),
             "satuan_produk": kol("satuan_produk", ke_teks, ""),
-            "yield_": kol("yield", ke_angka, None),
+            "yield_": kol("yield", angka, None),
             "kode_bahan": kol("kode_bahan", ke_teks, ""),
             "nama_bahan": kol("nama_bahan", ke_teks, ""),
             "satuan_bahan": kol("satuan_bahan", ke_teks, ""),
-            "qty": kol("qty", ke_angka, None),
-            "harga": kol("harga", ke_angka, None),
-            "harga_jual": kol("harga_jual", ke_angka, None),
+            "qty": kol("qty", angka, None),
+            "harga": kol("harga", angka, None),
+            "harga_jual": kol("harga_jual", angka, None),
         }
     )
     for k in ["yield_", "qty", "harga", "harga_jual"]:
@@ -846,7 +973,36 @@ def halaman_impor(berkas):
         value=pola,
         key=f"isibawah_{berkas.name}_{sheet}_{hdr}_{pola}",
     )
-    menus, bahans, resep_rows, masalah, d = siapkan(raw, peta, awal, isi_bawah)
+
+    # Sel angka yang tersimpan sebagai teks (misalnya "0.250") bisa dibaca dua cara
+    def sel_teks_berangka(kunci):
+        k = peta[kunci]
+        if k == TIDAK:
+            return 0
+        return int(raw[k].map(lambda v: isinstance(v, str) and bool(re.search(r"\d[.,]\d", v))).sum())
+
+    def gaya_indonesia(kunci):
+        k = peta[kunci]
+        if k == TIDAK:
+            return False
+        return bool(raw[k].map(lambda v: isinstance(v, str) and bool(re.search(r"\d\.\d{3},\d|\d,\d{1,2}$", v))).any())
+
+    n_teks = sum(sel_teks_berangka(k) for k in ["yield", "qty", "harga", "harga_jual"])
+    gaya_angka = "id"
+    if n_teks:
+        ada_id = any(gaya_indonesia(k) for k in ["yield", "qty", "harga", "harga_jual"])
+        pilihan_gaya = st.radio(
+            f"Ada {n_teks} sel angka yang tersimpan sebagai teks dengan titik atau koma (contoh 0.250 atau 1,5). "
+            "Bagaimana cara membacanya?",
+            [
+                "Gaya Inggris/ERP: titik = desimal (0.250 dibaca 0,25), koma = ribuan",
+                "Gaya Indonesia: titik = ribuan (0.250 dibaca 250), koma = desimal",
+            ],
+            index=1 if ada_id else 0,
+            key=f"gaya_{berkas.name}_{sheet}_{hdr}",
+        )
+        gaya_angka = "id" if pilihan_gaya.startswith("Gaya Indonesia") else "en"
+    menus, bahans, resep_rows, masalah, d = siapkan(raw, peta, awal, isi_bawah, gaya_angka)
 
     # cocokkan dengan data yang sudah ada di aplikasi
     b_kode = {r.kode: int(r.id) for r in bahan.itertuples() if isinstance(r.kode, str) and r.kode}
@@ -952,10 +1108,6 @@ ANGKA_SM = ["id", "id_snapshot", "harga_jual", "jumlah_porsi", "hpp"]
 KOL_SR = ["id", "id_snapshot", "id_snapshot_menu", "kunci_bahan", "kode_bahan",
           "nama_bahan", "satuan", "jumlah_dipakai", "harga_satuan"]
 ANGKA_SR = ["id", "id_snapshot", "id_snapshot_menu", "jumlah_dipakai", "harga_satuan"]
-
-
-def teks_atau_kosong(x):
-    return x if isinstance(x, str) else ""
 
 
 def harga_aktif(bom_saja):
