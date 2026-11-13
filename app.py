@@ -533,7 +533,7 @@ with tab3:
                 f"{n_janggal} menu memiliki HPP lebih dari 3x harga jual. Kemungkinan satuan qty dan harga "
                 "bahan tidak sejalan. Periksa lewat Rincian biaya di bawah."
             )
-                beda_satuan = []
+        beda_satuan = []
         for id_b, id_m in peta_produksi().items():
             sb = bahan.loc[bahan["id"] == id_b, "satuan"].iloc[0]
             sm = menu.loc[menu["id"] == id_m, "satuan_produk"].iloc[0]
