@@ -168,7 +168,7 @@ pembelian = ambil(
 )
 menu = ambil(
     "menu",
-    ["id", "nama_menu", "harga_jual", "jumlah_porsi_per_resep", "kode", "satuan_produk"],
+    ["id", "nama_menu", "harga_jual", "jumlah_porsi_per_resep", "kode", "satuan_produk", "jenis"],
     ["id", "harga_jual", "jumlah_porsi_per_resep"],
 )
 resep = ambil(
@@ -179,7 +179,41 @@ resep = ambil(
 
 label_bahan = {f"{r.nama_bahan} ({r.satuan})": int(r.id) for r in bahan.itertuples()}
 label_menu = {r.nama_menu: int(r.id) for r in menu.itertuples()}
+def peta_produksi():
+    """Pasangkan bahan dengan item produksi lewat kode yang sama: {id_bahan: id_menu}."""
+    ada_resep = set(resep["id_menu"].tolist())
+    prod = menu[(menu["jenis"] == "produksi") & (menu["id"].isin(ada_resep))]
+    kode_ke_menu = {r.kode: int(r.id) for r in prod.itertuples() if isinstance(r.kode, str) and r.kode}
+    return {
+        int(r.id): kode_ke_menu[r.kode]
+        for r in bahan.itertuples()
+        if isinstance(r.kode, str) and r.kode in kode_ke_menu
+    }
 
+
+def harga_produksi(harga_dasar):
+    """HPP per satuan tiap item produksi, boleh bertingkat. Hasil: {id_bahan: harga}."""
+    pasangan = peta_produksi()
+    porsi = {int(r.id): float(r.jumlah_porsi_per_resep) for r in menu.itertuples()}
+    hasil, sedang = {}, set()
+
+    def hpp(id_m):
+        if id_m in hasil:
+            return hasil[id_m]
+        if id_m in sedang:  # resep saling memanggil (berputar), hentikan
+            return 0.0
+        sedang.add(id_m)
+        biaya = 0.0
+        for b in resep[resep["id_menu"] == id_m].itertuples():
+            ib = int(b.id_bahan)
+            h = hpp(pasangan[ib]) if ib in pasangan else harga_dasar.get(ib)
+            if h is not None:
+                biaya += float(b.jumlah_dipakai) * h
+        sedang.discard(id_m)
+        hasil[id_m] = biaya / (porsi[id_m] or 1.0)
+        return hasil[id_m]
+
+    return {ib: hpp(im) for ib, im in pasangan.items()}
 # ---------------------------------------------------------------
 # JUDUL, PESAN, DAN PERINGATAN STOK
 # ---------------------------------------------------------------
@@ -434,10 +468,14 @@ with tab3:
             harga_satuan = harga_bom
         else:
             harga_satuan = {**harga_bom, **harga_beli}
-
+        hpp_prod = harga_produksi(harga_satuan)  # item produksi: harga dari HPP resepnya
+        harga_satuan = {**harga_satuan, **hpp_prod}
         hasil = []
         margin_per_id = {}
         for m in menu.itertuples():
+            if m.jenis == "produksi":  # tidak dijual, tidak ada margin
+                continue
+        
             baris_resep = resep[resep["id_menu"] == m.id]
             biaya = 0.0
             ada_bahan_tanpa_harga = False
@@ -495,7 +533,18 @@ with tab3:
                 f"{n_janggal} menu memiliki HPP lebih dari 3x harga jual. Kemungkinan satuan qty dan harga "
                 "bahan tidak sejalan. Periksa lewat Rincian biaya di bawah."
             )
-
+                beda_satuan = []
+        for id_b, id_m in peta_produksi().items():
+            sb = bahan.loc[bahan["id"] == id_b, "satuan"].iloc[0]
+            sm = menu.loc[menu["id"] == id_m, "satuan_produk"].iloc[0]
+            if isinstance(sm, str) and sm.strip() and str(sb).strip().lower() != sm.strip().lower():
+                nm = bahan.loc[bahan["id"] == id_b, "nama_bahan"].iloc[0]
+                beda_satuan.append(f"- **{nm}**: di resep menu dalam {sb}, hasil produksi dalam {sm}")
+        if beda_satuan:
+            st.warning(
+                "⚠️ **Satuan item produksi tidak sama dengan satuan bahan di resep menu:**\n"
+                + "\n".join(beda_satuan[:20])
+            )
         cari = st.text_input("Cari menu", placeholder="Ketik sebagian nama atau kode menu")
         hanya_merah = st.checkbox(f"Hanya tampilkan margin di bawah {BATAS_MARGIN}%")
         batas_tampil = st.selectbox("Jumlah kartu ditampilkan", ["25", "50", "100", "Semua"])
@@ -534,11 +583,14 @@ with tab3:
             for r in menu.itertuples():
                 if (resep["id_menu"] == r.id).any():
                     kode_r = r.kode if isinstance(r.kode, str) and r.kode else ""
-                    label_detail[f"{r.nama_menu} ({kode_r})" if kode_r else r.nama_menu] = int(r.id)
+                    nama_r = f"{r.nama_menu} ({kode_r})" if kode_r else r.nama_menu
+                    if r.jenis == "produksi":
+                        nama_r += " [produksi]"
+                    label_detail[nama_r] = int(r.id)
             if not label_detail:
                 st.caption("Belum ada menu yang memiliki resep.")
             else:
-                urut_detail = sorted(label_detail, key=lambda k: margin_per_id.get(label_detail[k], 0))
+                urut_detail = sorted(label_detail, key=lambda k: margin_per_id.get(label_detail[k], 999))
                 pilih_d = st.selectbox(
                     "Pilih menu (diurutkan dari margin terendah)", urut_detail, key="detail_hpp_menu"
                 )
@@ -549,7 +601,9 @@ with tab3:
                 isi_d = []
                 for b in baris_d.itertuples():
                     idb = int(b.id_bahan)
-                    if not sumber.startswith("Harga BOM") and idb in harga_beli:
+                    if idb in hpp_prod:
+                        h_d, asal = hpp_prod[idb], "Produksi"
+                    elif not sumber.startswith("Harga BOM") and idb in harga_beli:
                         h_d, asal = harga_beli[idb], "Pembelian"
                     elif idb in harga_bom:
                         h_d, asal = harga_bom[idb], "BOM"
@@ -797,7 +851,7 @@ def siapkan(raw, peta, awal, isi_bawah=False, gaya_angka="id"):
     return menus, bahans, resep_rows, masalah, d
 
 
-def simpan_impor(menus, bahans, resep_rows, ganti):
+def simpan_impor(menus, bahans, resep_rows, ganti, jenis="jual"):
     """Simpan hasil bacaan Excel ke Supabase secara bertahap."""
     bar = st.progress(0.0, text="Menyimpan bahan...")
     for b in bahans:
@@ -851,6 +905,7 @@ def simpan_impor(menus, bahans, resep_rows, ganti):
                 "harga_jual": m["harga_jual"] if m["harga_jual"] is not None else 0,
                 "jumlah_porsi_per_resep": m["yield"],
                 "satuan_produk": m["satuan"] or None,
+                "jenis": jenis,
             }
             for m in bagian
         ]
@@ -863,7 +918,7 @@ def simpan_impor(menus, bahans, resep_rows, ganti):
     if ganti:
         for m in lama_m:
             lama = ada_m[m["id"]]
-            ubah = {"jumlah_porsi_per_resep": m["yield"]}
+            ubah = {"jumlah_porsi_per_resep": m["yield"], "jenis": jenis}
             if m["satuan"]:
                 ubah["satuan_produk"] = m["satuan"]
             if m["harga_jual"] is not None:
@@ -1068,12 +1123,21 @@ def halaman_impor(berkas):
         ],
     )
     ganti = mode.startswith("Perbarui")
+    pilih_jenis = st.radio(
+        "Jenis BOM yang diunggah",
+        ["BOM menu jual", "BOM produksi (bahan setengah jadi)"],
+        key=f"jenis_{berkas.name}_{sheet}_{hdr}",
+    )
+    jenis_impor = "produksi" if pilih_jenis.startswith("BOM produksi") else "jual"
+    if jenis_impor == "produksi":
+        for m in menus:
+            m["harga_jual"] = None  # item produksi tidak dijual
     siap = len(resep_rows) > 0
     if not siap:
         st.error("Belum ada baris resep yang valid. Periksa pemetaan kolom di atas.")
     if st.button("Simpan semua ke database", type="primary", disabled=not siap):
         try:
-            n_b, n_m, n_r = simpan_impor(menus, bahans, resep_rows, ganti)
+            n_b, n_m, n_r = simpan_impor(menus, bahans, resep_rows, ganti, jenis_impor)
         except Exception as e:
             st.error(
                 f"Impor terhenti: {e}. Data yang sudah masuk aman. "
@@ -1120,7 +1184,8 @@ def harga_aktif(bom_saja):
     harga_bom = {
         int(r.id): float(r.harga_standar) for r in bahan.itertuples() if pd.notna(r.harga_standar)
     }
-    return harga_bom if bom_saja else {**harga_bom, **harga_beli}
+    dasar = harga_bom if bom_saja else {**harga_bom, **harga_beli}
+    return {**dasar, **harga_produksi(dasar)}
 
 
 def susun_snapshot(bom_saja):
