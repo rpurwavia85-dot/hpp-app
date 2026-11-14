@@ -1070,15 +1070,45 @@ def halaman_impor(berkas):
     b_nama = {r.nama_bahan.strip().lower(): int(r.id) for r in bahan.itertuples()}
     m_kode = {r.kode: int(r.id) for r in menu.itertuples() if isinstance(r.kode, str) and r.kode}
     m_nama = {r.nama_menu.strip().lower(): int(r.id) for r in menu.itertuples()}
+    # Cocokkan lewat kode. Nama hanya untuk data lama yang belum punya kode,
+    # dan satu data lama tidak boleh dipakai dua kali (mis. dua brand bernama sama).
+    b_nama_tanpa_kode = {
+        r.nama_bahan.strip().lower(): int(r.id)
+        for r in bahan.itertuples()
+        if not (isinstance(r.kode, str) and r.kode)
+    }
+    m_nama_tanpa_kode = {
+        r.nama_menu.strip().lower(): int(r.id)
+        for r in menu.itertuples()
+        if not (isinstance(r.kode, str) and r.kode)
+    }
+    terpakai_b, terpakai_m = set(), set()
     for b in bahans:
         b["id"] = b_kode.get(b["kode"]) if b["kode"] else None
         if b["id"] is None:
-            b["id"] = b_nama.get(b["nama"].lower())
+            b["id"] = b_nama_tanpa_kode.get(b["nama"].lower())
+        if b["id"] in terpakai_b:
+            b["id"] = None
+        elif b["id"] is not None:
+            terpakai_b.add(b["id"])
     for m in menus:
         m["id"] = m_kode.get(m["kode"]) if m["kode"] else None
         if m["id"] is None:
-            m["id"] = m_nama.get(m["nama"].lower())
-
+            m["id"] = m_nama_tanpa_kode.get(m["nama"].lower())
+        if m["id"] in terpakai_m:
+            m["id"] = None
+        elif m["id"] is not None:
+            terpakai_m.add(m["id"])
+    nama_sama = {}
+    for m in menus:
+        nama_sama.setdefault(m["nama"].strip().lower(), []).append(m["kode"] or "(tanpa kode)")
+    nama_sama = {n: ks for n, ks in nama_sama.items() if len(ks) > 1}
+    if nama_sama:
+        st.info(f"{len(nama_sama)} nama menu muncul dengan kode berbeda (misalnya beda brand). Masing-masing disimpan sebagai menu terpisah.")
+        st.dataframe(
+            pd.DataFrame([[n, ", ".join(ks)] for n, ks in nama_sama.items()], columns=["Nama menu", "Kode"]).head(100),
+            hide_index=True,
+        )
     st.markdown("**Pratinjau**")
     menu_baru = sum(1 for m in menus if m["id"] is None)
     bahan_baru = sum(1 for b in bahans if b["id"] is None)
