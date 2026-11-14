@@ -932,8 +932,14 @@ def simpan_impor(menus, bahans, resep_rows, ganti, jenis="jual"):
     id_menu = {m["key"]: m["id"] for m in baru_m}
     if ganti:
         id_menu.update({m["key"]: m["id"] for m in lama_m})
-        for bagian in potong([m["id"] for m in lama_m], 100):
-            db.table("resep").delete().in_("id_menu", bagian).execute()
+        for bagian in potong([m["id"] for m in lama_m], 50):
+            for _ in range(20):  # hapus berulang sampai benar-benar kosong
+                db.table("resep").delete().in_("id_menu", bagian).execute()
+                sisa = db.table("resep").select("id").in_("id_menu", bagian).limit(1).execute().data
+                if not sisa:
+                    break
+            else:
+                raise Exception("resep lama gagal dihapus sepenuhnya, impor dihentikan")
     id_bahan = {b["key"]: b["id"] for b in bahans}
     rows = [
         {"id_menu": id_menu[r["km"]], "id_bahan": id_bahan[r["kb"]], "jumlah_dipakai": r["qty"]}
